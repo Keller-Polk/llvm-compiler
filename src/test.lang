@@ -9,14 +9,14 @@ i32: x = 3;
 
 
 fn i32 Name(x:i32,u:i32){
-	i32: y = x * 5;
-	y = 5 ;
-	return y;
+	i32: *y = &x;
+	i32: t = *y;
+	return t;
 }
 
 
 
-fn void Start(){
-	Name(x);
+fn void run(){
+	Name(2,4);
 }
 

@@ -89,6 +89,7 @@ pub enum Type {
     Char,
     Void,
     Array(Box<Type>,u32),
+    Pointer(Box<Type>),
 }
 
 #[derive(Debug, Clone,PartialEq)]

@@ -11,6 +11,7 @@ use inkwell::types::BasicMetadataTypeEnum;
 use inkwell::values::FunctionValue;
 use std::collections::HashMap;
 use inkwell::values::PointerValue;
+use inkwell::values::{BasicValue, InstructionValue}; 
 
 
 use crate::lexer::*;
@@ -21,7 +22,7 @@ pub struct Codegen<'ctx> {
     pub context: &'ctx Context,
     pub module: Module<'ctx>,
     pub builder: Builder<'ctx>,
-    pub symbol_table: std::cell::RefCell<HashMap<String, PointerValue<'ctx>>>,
+    pub symbol_table: std::cell::RefCell<HashMap<String, (PointerValue<'ctx>, Type)>>,
 }
 pub enum Components<'ctx> {
 	Function(FunctionValue<'ctx>),
@@ -111,16 +112,24 @@ impl FunctionDecl{
 
 		for (i, arg) in function.get_param_iter().enumerate() {
 		    let param_name = &self.params[i].name;
-		    let param_type = arg.get_type();
+		    let param_type = self.params[i].ty.clone();
+		    let param_type_llvm = arg.get_type();
 
-		    let alloca = builder.build_alloca(param_type, param_name).unwrap();
+		    let alloca = builder.build_alloca(param_type_llvm, param_name).unwrap();
 
 		    builder.build_store(alloca, arg).unwrap();
-		    code_gen.symbol_table.borrow_mut().insert(param_name.clone(), alloca);
+		    code_gen.symbol_table.borrow_mut().insert(param_name.clone(), (alloca,param_type));
 		}
 
 		println!("{:?}",code_gen.symbol_table);
-		
+		for x in self.body.clone(){
+			match x {
+				Stmt::Assignment(x) => x.buildAssignment(&code_gen),
+				Stmt::Return(x) => buildReturn(&x,&code_gen),
+				Stmt::Expr(x) =>  x.buildExprs(&code_gen), 
+				_ => todo!(),
+			};
+		}
 
 		let current_block = code_gen.builder.get_insert_block().unwrap();
 		if current_block.get_terminator().is_none() {
@@ -146,45 +155,69 @@ impl FunctionDecl{
 }
 
 impl AssignmentStmt {
-	fn buildAssignment<'ctx>(&self, code_gen: &Codegen<'ctx>) -> PointerValue<'ctx> {
+	fn buildAssignment<'ctx>(&self, code_gen: &Codegen<'ctx>) -> InstructionValue<'ctx> {
 	    let context = &code_gen.context;
 	    let module = &code_gen.module;
 	    let builder = &code_gen.builder;
 
-	    let llvm_any_type = self.ty.to_llvm_type(code_gen);
+	    let llvm_any_type = match self.ty.clone(){
+	    	Some(x) => x.to_llvm_type(&code_gen),
+	    	None => {
+	    		let (_, ty) = code_gen.symbol_table.borrow().get(&self.name).cloned().expect(&format!("{:?} has not been defined.",&self.name));
+	    		ty.to_llvm_type(&code_gen)
+	    	}
+	    };
+	    
 
 	    let llvm_basic_type: inkwell::types::BasicTypeEnum = llvm_any_type
 	        .try_into()
 	        .expect("Compiler Error: Local variables cannot be initialized with Void types.");
 
-	    // 1. Allocate the local variable on the stack instead of adding it to the module
 	    let local_var = builder.build_alloca(llvm_basic_type, &self.name).unwrap();
+	    println!("{:?} safdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",self.value.clone());
 
 	    let (evaluated_val, ty) = self.value.clone()
 	        .expect("Compiler Error: Local variables must be initialized with a default value.")
 	        .llvm_expr(code_gen)
 	        .expect("REASON");
 
-	    let default_initializer: inkwell::values::BasicValueEnum<'ctx> = if self.pointer {
-	        if evaluated_val.is_pointer_value() {
-	            evaluated_val
-	        } else if evaluated_val.is_int_value() {
-	            let int_val = evaluated_val.into_int_value();
-	            let ptr_type = code_gen.context.ptr_type(inkwell::AddressSpace::from(0));
-	            
-	            int_val.const_to_pointer(ptr_type).into()
-	        } else {
-	            panic!("Compiler Error: Cannot initialize a pointer with a floating-point value.");
-	        }
-	    } else {
-	        evaluated_val
-	    };
 
-	    builder.build_store(local_var, default_initializer).unwrap();
+		let store_instruction = builder.build_store(local_var, evaluated_val).unwrap();
 
-	    local_var
+		if !code_gen.symbol_table.borrow().contains_key(&self.name){
+	    	code_gen.symbol_table.borrow_mut().insert(self.name.clone(), (local_var,ty));
+	    }
+
+		store_instruction
 	}
 
+}
+impl Expr {
+	fn buildExprs<'ctx>(&self, code_gen: &Codegen<'ctx>) -> InstructionValue<'ctx> {
+		let (evaluated_val, _ty) = self
+            .llvm_expr(code_gen)
+            .expect("Compiler Error: Failed to codegen standalone expression line.");
+
+        evaluated_val
+            .as_instruction_value()
+            .expect("Compiler Error: Standalone expression did not produce an instruction.")
+
+	}
+}
+
+fn buildReturn<'ctx>(expr: &Option<Expr>, code_gen: &Codegen<'ctx>) -> InstructionValue<'ctx> {
+    let builder = &code_gen.builder;
+
+    if expr.is_none() {
+        builder.build_return(None).unwrap()
+    } else {
+        let (local_var, _ty) = expr.clone()
+            .expect("Compiler Error: Local variables must be initialized with a default value.")
+            .llvm_expr(code_gen)
+            .expect("Failed to codegen return expression");
+
+        builder.build_return(Some(&local_var)).unwrap()
+    }
 }
 
 
@@ -281,15 +314,62 @@ impl Type{
                     .expect("Compiler Error: Cannot generate an LLVM array of Void components.");
 
                 basic_inner.array_type(*size).into()
-            }
+            },
+			Type::Pointer(inner_type) => {
+			    let any_inner = inner_type.to_llvm_type(code_gen);
+
+			    let basic_inner: BasicTypeEnum = any_inner
+			        .try_into()
+			        .expect("Compiler Error: Cannot create a pointer to Void.");
+
+			    basic_inner.ptr_type(inkwell::AddressSpace::default()).into()
+			}
+
         }
 	}
+	fn from_llvm_type(opt_llvm_ty: Option<BasicTypeEnum>) -> Self {
+        let llvm_ty = match opt_llvm_ty {
+            None => return Type::Void, 
+            Some(ty) => ty,
+        };
+
+        match llvm_ty {
+            BasicTypeEnum::IntType(int_ty) => {
+                match int_ty.get_bit_width() {
+                    1 => Type::Bool,
+                    8 => Type::I8,   
+                    16 => Type::I16,
+                    32 => Type::I32,
+                    64 => Type::I64,
+                    _ => panic!("Unsupported LLVM integer bit-width"),
+                }
+            }
+            BasicTypeEnum::FloatType(float_ty) => {
+                let type_str = float_ty.print_to_string().to_string();
+                if type_str.contains("float") {
+                    Type::F32
+                } else {
+                    Type::F64
+                }
+            }
+            BasicTypeEnum::PointerType(ptr_ty) => {
+                Type::Pointer(Box::new(Type::I8))
+            }
+            BasicTypeEnum::ArrayType(arr_ty) => {
+                let len = arr_ty.len();
+                let inner = Type::from_llvm_type(Some(arr_ty.get_element_type()));
+                Type::Array(Box::new(inner), len)
+            }
+            _ => todo!("Implement alternative composite or struct types if needed"),
+        }
+    }
 }
 
 
 
 impl Expr{
 	fn llvm_expr<'ctx>(& self, code_gen: &Codegen<'ctx>) -> Result<(BasicValueEnum<'ctx>,Type), String>{
+		println!("{:?}fff",self);
 		match self{
 			Expr::Operand(x) =>
 			{
@@ -352,14 +432,51 @@ impl Expr{
 					            float_ty.const_array(&float_values).into()
 					        }
 					        _ => {
-					            return Err("Compiler Error: Constant arrays of this type are not supported yet.".to_string());
+					            return Err("Error: Constant arrays of this type are not supported yet.".to_string());
 					        }
 					    };
 
 					    return Ok((const_array_val,Type::Array(Box::new(ty),t.len() as u32)));
 					},
+					Token::Identifier(name) => {
+    					let (ptr, ty) = code_gen.symbol_table.borrow().get(name).cloned().ok_or_else(|| format!("Undefined variable: {}", name))?;
+
+					    let llvm_type = ty.to_llvm_type(&code_gen);
+
+						let basic_type: BasicTypeEnum = llvm_type.try_into().map_err(|_| format!("Cannot load variable '{}' of type {:?}", name, ty))?;
+
+						let value = code_gen.builder.build_load(basic_type, ptr, name).map_err(|e| e.to_string())?;
+
+					    Ok((value, ty))
+					},
+					Token::Call(func_name,args_exprs) =>{
+						let function = code_gen.module.get_function(func_name)
+        					.expect(&format!("Compiler Error: Function {} is not defined.", func_name));
+        				let mut compiled_args: Vec<inkwell::values::BasicValueEnum<'ctx>> = Vec::new();
+						for arg_expr in args_exprs.iter() {
+					        let (val, _ty) = arg_expr.llvm_expr(code_gen)?;
+					        compiled_args.push(val);
+								    }
+					    let metadata_args: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> = compiled_args
+					        .iter()
+					        .map(|val| (*val).into())
+					        .collect();
+						let call_site = code_gen.builder
+							.build_call(function, &metadata_args, &format!("{}_call_tmp", func_name))
+					        .unwrap();
+
+						match call_site.try_as_basic_value().left() {
+							Some(basic_val) => {
+					            let ret_ty = Type::from_llvm_type(Some(function.get_type().get_return_type().unwrap())); 
+					            Ok((basic_val, ret_ty))
+					        }
+					        None => {
+					            panic!("Handling for void function returns goes here");
+					        }
+					    }
+					},	
 					_ => {
-						panic!("{:?}",x);
+						panic!("not a valid Identifier {:?}",x);
 					},
 
 				}
@@ -418,6 +535,7 @@ impl Expr{
 								    let result = code_gen.builder.build_int_compare(pred, left_int, right_int, "cmp_le_tmp").unwrap();
 								    return Ok((result.into(), Type::Bool))
 								},
+							
 								_ => {
 									panic!("{:?}",x);
 								}
@@ -477,7 +595,65 @@ impl Expr{
 						Token::LParen => {
 							return y.get(0).expect("this should have one argument").llvm_expr(code_gen);
 						},
-						_ => todo!()
+						Token::Ampersand => {
+				            // &expression
+				            let expr = y
+				                .get(0)
+				                .expect("& should have one operand");
+
+				            // The operand needs to be something that has an address.
+				            match expr {
+				                Expr::Operand(Token::Identifier(name)) => {
+				                    let (ptr, ty) = code_gen
+				                        .symbol_table
+				                        .borrow()
+				                        .get(name)
+				                        .cloned()
+				                        .ok_or_else(|| {
+				                            format!("Undefined variable: {}", name)
+				                        })?;
+
+				                    let ty = code_gen
+				                        .symbol_table
+				                        .borrow()
+				                        .get(name)
+				                        .map(|(_, ty)| ty.clone())
+				                        .ok_or_else(|| {
+				                            format!("Undefined variable: {}", name)
+				                        })?;
+
+				                    Ok((ptr.into(), Type::Pointer(Box::new(ty))))
+				                }
+				                _ => panic!("operations cannot be addressed"),
+				            }
+				        },
+				        Token::Star => {
+						    // *expression
+						    let expr = y
+						        .get(0)
+						        .expect("Dereference should have one operand");
+
+						    let (evaluated_val, ty) = expr.llvm_expr(code_gen)?;
+
+						    if let Type::Pointer(inner_ty) = ty {
+						        let builder = &code_gen.builder;
+
+						        let ptr_val = evaluated_val.into_pointer_value();
+
+						        let llvm_load_type: inkwell::types::BasicTypeEnum = inner_ty
+						            .to_llvm_type(code_gen)
+						            .try_into()
+						            .expect("Compiler Error: Cannot dereference a pointer to a void type.");
+
+						        let loaded_val = builder.build_load(llvm_load_type, ptr_val, "deref_tmp").unwrap();
+
+						        Ok((loaded_val, *inner_ty))
+						    } else {
+						        panic!("Compiler Error: Cannot dereference a non-pointer type: {:?}", ty);
+						    }
+						},
+
+				        _ => todo!(),
 					}
 				}else{
 					return Err(format!(

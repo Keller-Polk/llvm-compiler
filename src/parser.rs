@@ -159,6 +159,12 @@ impl TokenParse {
     pub fn function_parse(&mut self) -> Item{
         let mut ty = match self.next(){
             TokenExpr::Key(Token::Type(x)) => x,
+            TokenExpr::Op(Token::Star) => {
+                match self.next(){
+                    TokenExpr::Key(Token::Type(x)) => Type::Pointer(Box::new(x)),
+                    _ => Type::Pointer(Box::new(Type::Void)),
+                }
+            },
             _ => Type::Void,
         };
 
