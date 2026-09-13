@@ -402,18 +402,20 @@ impl GlobalDecl {
 		    .llvm_expr(code_gen)
 		    .expect("REASON");
 
+        if self.pointer && !evaluated_val.is_pointer_value() && !evaluated_val.is_int_value() {
+            std::panic::panic_any(
+                "Compiler Error: Cannot initialize a global pointer with a floating-point value.",
+            );
+        }
+
         let default_initializer: inkwell::values::BasicValueEnum<'ctx> = if self.pointer {
             if evaluated_val.is_pointer_value() {
                 evaluated_val
-            } else if evaluated_val.is_int_value() {
+            } else {
                 let int_val = evaluated_val.into_int_value();
                 let ptr_type = code_gen.context.ptr_type(inkwell::AddressSpace::from(0));
 
                 int_val.const_to_pointer(ptr_type).into()
-            } else {
-                panic!(
-                    "Compiler Error: Cannot initialize a global pointer with a floating-point value."
-                );
             }
         } else {
             evaluated_val
@@ -646,14 +648,13 @@ impl Expr {
                             ));
                             Ok((basic_val, ret_ty))
                         }
-                        None => {
-                            panic!("Handling for void function returns goes here");
-                        }
+                        None => Err(
+                            "Compiler Error: Cannot use void function return as a value."
+                                .to_string(),
+                        ),
                     }
                 }
-                _ => {
-                    panic!("not a valid Identifier {:?}", x);
-                }
+                _ => Err(format!("not a valid Identifier {:?}", x)),
             },
             Expr::Operation(x, y) => {
                 if y.len() == 2 {
@@ -762,9 +763,7 @@ impl Expr {
                                 return Ok((result.into(), Type::Bool));
                             }
 
-                            _ => {
-                                panic!("{:?}", x);
-                            }
+                            _ => Err(format!("Unsupported integer operation: {:?}", x)),
                         },
                         (
                             inkwell::values::BasicValueEnum::FloatValue(left_float),
@@ -920,10 +919,10 @@ impl Expr {
 
                                 Ok((loaded_val, *inner_ty))
                             } else {
-                                panic!(
+                                Err(format!(
                                     "Compiler Error: Cannot dereference a non-pointer type: {:?}",
                                     ty
-                                );
+                                ))
                             }
                         }
 

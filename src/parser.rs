@@ -105,16 +105,16 @@ fn errorHandle(message: String, file: &mut TokenParse) -> ! {
     } else {
         println!("parseing error, {:?}", message);
     }
-    panic!()
+    return panic!();
 }
 
 fn errormess(message: String, file: &mut TokenParse) -> String {
-    format!(
+    return format!(
         "parseing error at line:{:?} colum:{:?}, {:?}",
         (file.locations[0].line),
         (file.locations[0].colum),
         message
-    )
+    );
 }
 
 // a state we convert our lexed expresions to in order to parse them
