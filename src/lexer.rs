@@ -1,9 +1,7 @@
-use std::fs;
 use crate::parser::Expr;
+use std::fs;
 
-
-
-#[derive(Debug, Clone,PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     // literals
     Int(u32),
@@ -11,7 +9,7 @@ pub enum Token {
     Bool(bool),
     String(String),
     Array(Box<Vec<Expr>>),
-    Call(String,Box<Vec<Expr>>),
+    Call(String, Box<Vec<Expr>>),
 
     // identifiers
     Identifier(String),
@@ -19,7 +17,7 @@ pub enum Token {
     // operators
     Plus,
     Minus,
-    Star,//*
+    Star, //*
     Slash,
     Percent, //in retrospect frogot modulus opperation change soon
 
@@ -33,9 +31,8 @@ pub enum Token {
     Greater,
     GreaterEqual,
 
-
     Not,
-    Ampersand,//&
+    Ampersand, //&
 
     // punctuation
     LParen,
@@ -48,14 +45,12 @@ pub enum Token {
     Colon,
     Equl,
     Semicolon,
-    
-
 
     // keywords
     If,
     Else,
     For,
-    While, 
+    While,
     Const,
     Let,
     Fn,
@@ -63,19 +58,15 @@ pub enum Token {
     Continue,
     Break,
 
-
     // types
     Type(Type),
-
-
 
     EOF,
 }
 
-
-#[derive(Debug, Clone,PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Type {
-    I8, 
+    I8,
     I16,
     I32,
     I64,
@@ -88,26 +79,21 @@ pub enum Type {
     Bool,
     Char,
     Void,
-    Array(Box<Type>,u32),
+    Array(Box<Type>, u32),
     Pointer(Box<Type>),
 }
 
-#[derive(Debug, Clone,PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct location {
-    pub colum:u32,
-    pub line:u32,
+    pub colum: u32,
+    pub line: u32,
 }
 
-
-#[derive(Debug,Clone,PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct lexedFile {
-    pub tokens : Vec<Token>,
-    pub locations :Vec<location>,
+    pub tokens: Vec<Token>,
+    pub locations: Vec<location>,
 }
-
-
-
-
 
 impl Token {
     pub fn infix_binding_power(op: Token) -> (f32, f32) {
@@ -120,11 +106,7 @@ impl Token {
 
             Token::EqualEqual | Token::NotEqual => (0.7, 0.8),
 
-
-            Token::Less
-            | Token::LessEqual
-            | Token::Greater
-            | Token::GreaterEqual => (0.9, 1.0),
+            Token::Less | Token::LessEqual | Token::Greater | Token::GreaterEqual => (0.9, 1.0),
 
             Token::Plus | Token::Minus => (1.1, 1.2),
 
@@ -139,14 +121,14 @@ impl Token {
             _ => panic!("bad op: {:?}", op),
         }
     }
-    pub fn lexer(line:&str) -> lexedFile {
+    pub fn lexer(line: &str) -> lexedFile {
         let mut locations = Vec::new();
         let chars: Vec<char> = line.chars().collect();
         let mut tokens = Vec::new();
         let mut i = 0;
 
-        let mut row:u32 = 1;
-        let mut col:u32 = 1;
+        let mut row: u32 = 1;
+        let mut col: u32 = 1;
 
         while i < chars.len() {
             let c = chars[i];
@@ -172,7 +154,7 @@ impl Token {
                 while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
                     i += 1
                 }
-                let text:String = chars[start_i..i].iter().collect();
+                let text: String = chars[start_i..i].iter().collect();
                 let token = match text.as_str() {
                     "if" => Token::If,
                     "else" => Token::Else,
@@ -186,41 +168,49 @@ impl Token {
                     "false" => Token::Bool(false),
                     "continue" => Token::Continue,
                     "break" => Token::Break,
-                    "i8" => Token::Type(Type::I8), 
-                    "i16" => Token::Type(Type::I16), 
-                    "i32" => Token::Type(Type::I32), 
-                    "i64" => Token::Type(Type::I64), 
-                    "u8" => Token::Type(Type::U8), 
-                    "u16" => Token::Type(Type::U16), 
-                    "u32" => Token::Type(Type::U32), 
-                    "u64" => Token::Type(Type::U64), 
-                    "f32" => Token::Type(Type::F32), 
-                    "f64" => Token::Type(Type::F64), 
-                    "bool" => Token::Type(Type::Bool), 
-                    "char" => Token::Type(Type::Char), 
-                    "void" => Token::Type(Type::Void), 
+                    "i8" => Token::Type(Type::I8),
+                    "i16" => Token::Type(Type::I16),
+                    "i32" => Token::Type(Type::I32),
+                    "i64" => Token::Type(Type::I64),
+                    "u8" => Token::Type(Type::U8),
+                    "u16" => Token::Type(Type::U16),
+                    "u32" => Token::Type(Type::U32),
+                    "u64" => Token::Type(Type::U64),
+                    "f32" => Token::Type(Type::F32),
+                    "f64" => Token::Type(Type::F64),
+                    "bool" => Token::Type(Type::Bool),
+                    "char" => Token::Type(Type::Char),
+                    "void" => Token::Type(Type::Void),
                     _ => Token::Identifier(text),
                 };
-                locations.push(location{colum :col,line:row});
+                locations.push(location {
+                    colum: col,
+                    line: row,
+                });
                 tokens.push(token);
                 continue;
             }
             if c.is_numeric() {
                 let mut has_decimal = false;
                 let start_i = i;
-                while i < chars.len() && (chars[i].is_numeric() || (!has_decimal && chars[i] == '.')) {
-                    if chars[i] == '.'{
+                while i < chars.len()
+                    && (chars[i].is_numeric() || (!has_decimal && chars[i] == '.'))
+                {
+                    if chars[i] == '.' {
                         has_decimal = true;
                     }
                     i += 1
                 }
-                let text:String = chars[start_i..i].iter().collect();
+                let text: String = chars[start_i..i].iter().collect();
                 let token = if has_decimal {
                     Token::Float(text.parse().unwrap())
                 } else {
                     Token::Int(text.parse().unwrap())
                 };
-                locations.push(location{colum :col,line:row});
+                locations.push(location {
+                    colum: col,
+                    line: row,
+                });
                 tokens.push(token);
                 continue;
             }
@@ -267,17 +257,22 @@ impl Token {
                 ']' => Token::RBracket,
                 _ => panic!("Unknown character: {}", c),
             };
-            locations.push(location{colum :col,line:row});
+            locations.push(location {
+                colum: col,
+                line: row,
+            });
             tokens.push(token);
             i += 1;
-
         }
-        return lexedFile{tokens:tokens,locations:locations};
-    }  
+        return lexedFile {
+            tokens: tokens,
+            locations: locations,
+        };
+    }
 
-    pub fn load_file(path: &str) -> lexedFile{
+    pub fn load_file(path: &str) -> lexedFile {
         let loadtmp = fs::read_to_string(path);
-        let contents:String;
+        let contents: String;
         match loadtmp {
             Ok(c) => {
                 contents = c;
@@ -288,12 +283,5 @@ impl Token {
             }
         }
         return Self::lexer(&contents);
-
     }
 }
-
-
-
-
-
-
