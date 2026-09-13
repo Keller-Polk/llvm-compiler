@@ -12,8 +12,19 @@ fn i32 Name(x:i32,u:i32){
 }
 
 
-
 fn void run(){
+	print(sizeof(i32));
+	i32: *arr = malloc(sizeof(i32) * 10);
+	i32: len = 0;
+	arr[0] = 11;
+	print(arr[0]);
+	array_set(arr, 1, 22);
+	print(array_get(arr, 1));
+	push(arr, &len, 33);
+	push(arr, &len, 44);
+	print(pop(arr, &len));
+	print(pop(arr, &len));
+	free(arr);
 	if (1 == 1){
 		Name(2,4);
 	}
@@ -22,3 +33,4 @@ fn void run(){
 		y = y + 1;
 	}
 }
+

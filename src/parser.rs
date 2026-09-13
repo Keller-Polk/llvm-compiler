@@ -27,6 +27,7 @@ pub struct TokenParseItem {
 pub enum Expr {
     Operand(Token),
     Operation(Token, Vec<Expr>),
+    SizeOf(Type),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -79,6 +80,8 @@ pub struct AssignmentStmt {
     pub ty: Option<Type>,
     pub value: Option<Expr>,
     pub pointer: bool,
+    pub dereference: bool,
+    pub index: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -346,8 +349,10 @@ impl TokenParse {
     */
 
     pub fn parse_Stmt_Assignment_Short(&mut self, first: TokenParseItem) -> Stmt {
-        match self.peek() {
-            TokenExpr::Key(Token::Equl) => {
+        match (&first.tokens, self.peek()) {
+            (_, TokenExpr::Key(Token::Equl))
+            | (TokenExpr::Op(Token::Star), _)
+            | (TokenExpr::Operand(Token::Identifier(_)), TokenExpr::Op(Token::LBracket)) => {
                 self.push(first);
                 self.parse_Stmt_Assignment(None)
             }
@@ -559,10 +564,16 @@ impl TokenParse {
         }
 
         let mut pointer = false;
+        let mut dereference = false;
         let name = match self.next() {
             TokenExpr::Operand(Token::Identifier(name)) => name,
             TokenExpr::Op(Token::Star) => {
-                pointer = true;
+                if ty.is_some() {
+                    pointer = true;
+                } else {
+                    dereference = true;
+                }
+
                 match self.next() {
                     TokenExpr::Operand(Token::Identifier(name)) => name,
                     x => errorHandle(
@@ -575,6 +586,21 @@ impl TokenParse {
                 format!("varbles must have valid alphanumeric names {:?}", x),
                 self,
             ),
+        };
+
+        let index = if self.peek() == TokenExpr::Op(Token::LBracket) {
+            self.next();
+            let index_expr = Expr::parse_expression(self, 0.0);
+            if self.peek() != TokenExpr::Op(Token::RBracket) {
+                errorHandle(
+                    format!("index must close with ']' got {:?}", self.peek()),
+                    self,
+                );
+            }
+            self.next();
+            Some(index_expr)
+        } else {
+            None
         };
 
         let value: Option<Expr>;
@@ -607,6 +633,8 @@ impl TokenParse {
             ty: ty,
             value: value,
             pointer: pointer,
+            dereference: dereference,
+            index: index,
         };
         if pointer {
             assinment.ty = Some(Type::Pointer(Box::new(
@@ -759,6 +787,7 @@ impl TokenExpr {
             | Token::Let
             | Token::Continue
             | Token::Break
+            | Token::SizeOf
             | Token::Fn => TokenExpr::Key(tok),
 
             Token::EOF => TokenExpr::Eof,
@@ -785,6 +814,52 @@ impl Expr {
 
             TokenExpr::Op(Token::Not) => {
                 Expr::Operation(Token::Not, vec![Self::parse_expression(lexer, 10.0)])
+            }
+
+            TokenExpr::Key(Token::SizeOf) => {
+                if lexer.peek() != TokenExpr::Op(Token::LParen) {
+                    errorHandle(
+                        format!("sizeof must be followed by '(' got {:?}", lexer.peek()),
+                        lexer,
+                    );
+                }
+                lexer.next();
+
+                let mut ty = match lexer.next() {
+                    TokenExpr::Key(Token::Type(ty)) => ty,
+                    t => errorHandle(format!("sizeof expects a type, got {:?}", t), lexer),
+                };
+
+                if lexer.peek() == TokenExpr::Op(Token::LBracket) {
+                    lexer.next();
+                    ty = match lexer.next() {
+                        TokenExpr::Operand(Token::Int(len)) => Type::Array(Box::new(ty), len),
+                        t => errorHandle(
+                            format!("cannot use a non integer array length in sizeof: {:?}", t),
+                            lexer,
+                        ),
+                    };
+                    if lexer.peek() != TokenExpr::Op(Token::RBracket) {
+                        errorHandle(
+                            format!(
+                                "sizeof array type must close with ']' got {:?}",
+                                lexer.peek()
+                            ),
+                            lexer,
+                        );
+                    }
+                    lexer.next();
+                }
+
+                if lexer.peek() != TokenExpr::Op(Token::RParen) {
+                    errorHandle(
+                        format!("sizeof must close with ')' got {:?}", lexer.peek()),
+                        lexer,
+                    );
+                }
+                lexer.next();
+
+                Expr::SizeOf(ty)
             }
 
             TokenExpr::Op(Token::LBracket) => {
@@ -840,34 +915,18 @@ impl Expr {
 
             if op == Token::Comma {
                 let mut args = vec![];
-                let mut expr: Expr;
-                match lexer.peek() {
-                    TokenExpr::Operand(_) => loop {
-                        expr = Self::parse_expression(lexer, 0.0);
-                        let array = match expr {
-                            Expr::Operation(Token::Comma, x) => x,
-                            Expr::Operand(_) => vec![expr],
-                            _ => errorHandle(
-                                format!("not a properly errorHandle(formated array {:?}", expr),
-                                lexer,
-                            ),
-                        };
-                        for x in array {
-                            args.push(x);
-                        }
-                        if lexer.peek() == TokenExpr::Op(Token::Comma) {
-                            lexer.next();
-                        } else {
-                            break;
-                        }
-                    },
-                    _ => errorHandle(
-                        format!(
-                            "arrays or function specifcations seperated by commas must be closed {:?}",
-                            lexer.peek()
-                        ),
-                        lexer,
-                    ),
+                loop {
+                    let expr = Self::parse_expression(lexer, 0.0);
+                    match expr {
+                        Expr::Operation(Token::Comma, x) => args.extend(x),
+                        expr => args.push(expr),
+                    }
+
+                    if lexer.peek() == TokenExpr::Op(Token::Comma) {
+                        lexer.next();
+                    } else {
+                        break;
+                    }
                 }
 
                 let mut vals = vec![lhs];
@@ -876,19 +935,29 @@ impl Expr {
                 lhs = Expr::Operation(op.clone(), vals);
 
                 continue;
+            } else if op == Token::LBracket {
+                let index = Self::parse_expression(lexer, 0.0);
+                if lexer.peek() != TokenExpr::Op(Token::RBracket) {
+                    errorHandle(
+                        format!("index must close with ']' got {:?}", lexer.peek()),
+                        lexer,
+                    );
+                }
+                lexer.next();
+                lhs = Expr::Operation(Token::LBracket, vec![lhs, index]);
+                continue;
             } else if op == Token::LParen {
                 let name_t = match lhs {
                     Expr::Operand(x) => x,
                     _ => errorHandle(format!("functions must have valid names {:?}", lhs), lexer),
                 };
-                let array = match Self::parse_expression(lexer, 0.0) {
-                    Expr::Operation(Token::Comma, x) => x,
-                    Expr::Operand(x) => vec![Expr::Operand(x)],
-                    _ => errorHandle(
-                        format!("not a properly errorHandle(formated function call"),
-                        lexer,
-                    ),
-                };
+                let mut array = vec![];
+                if lexer.peek() != TokenExpr::Op(Token::RParen) {
+                    array = match Self::parse_expression(lexer, 0.0) {
+                        Expr::Operation(Token::Comma, x) => x,
+                        expr => vec![expr],
+                    };
+                }
                 let name = match name_t {
                     Token::Identifier(x) => x,
                     _ => errorHandle(

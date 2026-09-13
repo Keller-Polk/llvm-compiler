@@ -1,6 +1,11 @@
+use inkwell::OptimizationLevel;
+use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::Module;
+use inkwell::targets::{
+    CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
+};
 use inkwell::types::BasicMetadataTypeEnum;
 use inkwell::types::BasicType;
 use inkwell::types::{AnyTypeEnum, BasicTypeEnum};
@@ -12,6 +17,8 @@ use inkwell::values::{BasicValue, InstructionValue};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::convert::TryInto;
+use std::path::Path;
+use std::process::Command;
 
 use crate::lexer::*;
 use crate::parser::*;
@@ -21,7 +28,15 @@ pub struct Codegen<'ctx> {
     pub module: Module<'ctx>,
     pub builder: Builder<'ctx>,
     pub symbol_table: RefCell<Vec<HashMap<String, (PointerValue<'ctx>, Type)>>>,
+    pub loop_stack: RefCell<Vec<LoopContext<'ctx>>>,
 }
+
+#[derive(Clone, Copy)]
+pub struct LoopContext<'ctx> {
+    pub continue_block: BasicBlock<'ctx>,
+    pub break_block: BasicBlock<'ctx>,
+}
+
 pub enum Components<'ctx> {
     Function(FunctionValue<'ctx>),
     Global(GlobalValue<'ctx>),
@@ -40,21 +55,73 @@ impl<'ctx> Codegen<'ctx> {
             .pop()
             .expect("Compiler Error: Scope underflow.");
     }
+
+    pub fn push_loop(&self, continue_block: BasicBlock<'ctx>, break_block: BasicBlock<'ctx>) {
+        self.loop_stack.borrow_mut().push(LoopContext {
+            continue_block,
+            break_block,
+        });
+    }
+
+    pub fn pop_loop(&self) {
+        self.loop_stack
+            .borrow_mut()
+            .pop()
+            .expect("Compiler Error: Loop stack underflow.");
+    }
+
+    pub fn current_loop(&self) -> LoopContext<'ctx> {
+        *self
+            .loop_stack
+            .borrow()
+            .last()
+            .expect("Compiler Error: break/continue used outside of a loop.")
+    }
+
+    pub fn current_block_has_terminator(&self) -> bool {
+        self.builder
+            .get_insert_block()
+            .and_then(|block| block.get_terminator())
+            .is_some()
+    }
 }
 
 impl Program {
-    pub fn build(&self) {
+    pub fn build(&self, name: &str) {
         // init
+        Target::initialize_native(&InitializationConfig::default())
+            .expect("Compiler Error: Failed to initialize native LLVM target.");
+
         let context = Context::create();
         let module = context.create_module("my_compiler");
         let builder = context.create_builder();
+
+        let target_triple = TargetMachine::get_default_triple();
+        let target = Target::from_triple(&target_triple)
+            .expect("Compiler Error: Failed to get native LLVM target.");
+        let target_machine = target
+            .create_target_machine(
+                &target_triple,
+                "generic",
+                "",
+                OptimizationLevel::None,
+                RelocMode::Default,
+                CodeModel::Default,
+            )
+            .expect("Compiler Error: Failed to create LLVM target machine.");
+
+        module.set_triple(&target_triple);
+        module.set_data_layout(&target_machine.get_target_data().get_data_layout());
 
         let code_gen = Codegen {
             context: &context,
             module: module,
             builder: builder,
             symbol_table: std::cell::RefCell::new(Vec::new()),
+            loop_stack: std::cell::RefCell::new(Vec::new()),
         };
+
+        declareBuiltinFunctions(&code_gen);
 
         // 1. Create a hidden dummy function frame
         let void_type = context.void_type();
@@ -76,9 +143,11 @@ impl Program {
                 Item::Function(func_def) => Ok(Components::Function(
                     func_def
                         .buildFunction(&code_gen)
-                        .expect("your function has an error"),
+                        .expect("Compiler Error: Failed to build function."),
                 )),
-                _ => Err("not a function or a gloabal defintion"),
+                _ => {
+                    Err("Compiler Error: top-level item must be a function or global declaration.")
+                }
             };
         }
 
@@ -86,9 +155,60 @@ impl Program {
             dummy_func.delete();
         }
 
-        code_gen.module.verify().unwrap();
-        println!("--- Generated LLVM IR ---");
-        code_gen.module.print_to_stderr();
+        buildMainWrapper(&code_gen);
+
+        code_gen
+            .module
+            .verify()
+            .expect("Compiler Error: Generated LLVM module failed verification.");
+
+        compileModule(&code_gen, &target_machine, name);
+    }
+}
+
+fn buildMainWrapper<'ctx>(code_gen: &Codegen<'ctx>) {
+    if code_gen.module.get_function("main").is_some() {
+        return;
+    }
+
+    let run_function = match code_gen.module.get_function("run") {
+        Some(function) => function,
+        None => return,
+    };
+
+    let i32_type = code_gen.context.i32_type();
+    let main_type = i32_type.fn_type(&[], false);
+    let main_function = code_gen.module.add_function("main", main_type, None);
+    let entry_block = code_gen.context.append_basic_block(main_function, "entry");
+
+    code_gen.builder.position_at_end(entry_block);
+    code_gen
+        .builder
+        .build_call(run_function, &[], "run_call")
+        .unwrap();
+
+    let zero = i32_type.const_int(0, false);
+    code_gen.builder.build_return(Some(&zero)).unwrap();
+}
+
+fn compileModule<'ctx>(code_gen: &Codegen<'ctx>, target_machine: &TargetMachine, name: &str) {
+    let object_path = Path::new("output.o");
+    let executable_path = Path::new(name);
+
+    target_machine
+        .write_to_file(&code_gen.module, FileType::Object, object_path)
+        .expect("Compiler Error: Failed to write object file.");
+
+    let status = Command::new("cc")
+        .arg("-no-pie")
+        .arg(object_path)
+        .arg("-o")
+        .arg(executable_path)
+        .status()
+        .expect("Compiler Error: Failed to run system linker 'cc'.");
+
+    if !status.success() {
+        panic!("Compiler Error: Linking failed with status {:?}.", status);
     }
 }
 
@@ -122,6 +242,7 @@ impl FunctionDecl {
             inkwell::types::AnyTypeEnum::VoidType(void_ty) => void_ty.fn_type(&arg_types, false),
             inkwell::types::AnyTypeEnum::IntType(int_ty) => int_ty.fn_type(&arg_types, false),
             inkwell::types::AnyTypeEnum::FloatType(float_ty) => float_ty.fn_type(&arg_types, false),
+            inkwell::types::AnyTypeEnum::PointerType(ptr_ty) => ptr_ty.fn_type(&arg_types, false),
             _ => return Err("Unsupported function return type.".to_string()),
         };
 
@@ -148,8 +269,11 @@ impl FunctionDecl {
             current_scope.insert(param_name.clone(), (alloca, param_type));
         }
 
-        println!("{:?}", code_gen.symbol_table);
         for x in self.body.clone() {
+            if code_gen.current_block_has_terminator() {
+                break;
+            }
+
             x.buildLine(&code_gen);
         }
 
@@ -169,6 +293,10 @@ impl FunctionDecl {
                     let default_zero = float_ty.const_float(0.0);
                     code_gen.builder.build_return(Some(&default_zero)).unwrap();
                 }
+                inkwell::types::AnyTypeEnum::PointerType(ptr_ty) => {
+                    let default_null = ptr_ty.const_null();
+                    code_gen.builder.build_return(Some(&default_null)).unwrap();
+                }
                 _ => {
                     return Err(
                         "Missing explicit return statement for this return type.".to_string()
@@ -183,12 +311,27 @@ impl FunctionDecl {
 impl Stmt {
     fn buildLine<'ctx>(self, code_gen: &Codegen<'ctx>) {
         match self {
-            Stmt::Assignment(x) => x.buildAssignment(&code_gen),
-            Stmt::Return(x) => buildReturn(&x, &code_gen),
-            Stmt::Expr(x) => x.buildExprs(&code_gen),
-            Stmt::If(x) => x.buildIf(&code_gen),
-            Stmt::While(x) => x.buildWhile(&code_gen),
-            _ => todo!(),
+            Stmt::Assignment(x) => {
+                x.buildAssignment(&code_gen);
+            }
+            Stmt::Return(x) => {
+                buildReturn(&x, &code_gen);
+            }
+            Stmt::Expr(x) => {
+                x.buildExprs(&code_gen);
+            }
+            Stmt::If(x) => {
+                x.buildIf(&code_gen);
+            }
+            Stmt::While(x) => {
+                x.buildWhile(&code_gen);
+            }
+            Stmt::Break => {
+                buildBreak(&code_gen);
+            }
+            Stmt::Continue => {
+                buildContinue(&code_gen);
+            }
         };
     }
 }
@@ -215,6 +358,10 @@ impl IfStmt {
         builder.position_at_end(then_block);
 
         for x in self.then_branch.clone() {
+            if code_gen.current_block_has_terminator() {
+                break;
+            }
+
             x.buildLine(&code_gen);
         }
 
@@ -231,8 +378,14 @@ impl IfStmt {
 
         code_gen.push_scope();
 
-        for x in self.then_branch.clone() {
-            x.buildLine(&code_gen);
+        if let Some(else_branch) = &self.else_branch {
+            for x in else_branch.clone() {
+                if code_gen.current_block_has_terminator() {
+                    break;
+                }
+
+                x.buildLine(&code_gen);
+            }
         }
 
         code_gen.pop_scope();
@@ -283,10 +436,18 @@ impl WhileStmt {
 
         builder.position_at_end(body_block);
         code_gen.push_scope();
+        code_gen.push_loop(cond_block, end_block);
+
         for x in self.body.clone() {
+            if code_gen.current_block_has_terminator() {
+                break;
+            }
+
             x.buildLine(&code_gen);
         }
-        code_gen.push_scope();
+
+        code_gen.pop_loop();
+        code_gen.pop_scope();
         if builder
             .get_insert_block()
             .unwrap()
@@ -302,11 +463,129 @@ impl WhileStmt {
     }
 }
 
+fn index_to_i64<'ctx>(
+    index: BasicValueEnum<'ctx>,
+    code_gen: &Codegen<'ctx>,
+) -> inkwell::values::IntValue<'ctx> {
+    let index_int = index.into_int_value();
+    let i64_type = code_gen.context.i64_type();
+
+    if index_int.get_type().get_bit_width() == 64 {
+        index_int
+    } else {
+        code_gen
+            .builder
+            .build_int_z_extend(index_int, i64_type, "index_i64")
+            .unwrap()
+    }
+}
+
+fn buildIndexPointer<'ctx>(
+    array_expr: &Expr,
+    index_expr: &Expr,
+    code_gen: &Codegen<'ctx>,
+) -> Result<(PointerValue<'ctx>, Type), String> {
+    let (array_value, array_ty) = array_expr.llvm_expr(code_gen)?;
+    let (index_value, _index_ty) = index_expr.llvm_expr(code_gen)?;
+    let index = index_to_i64(index_value, code_gen);
+
+    let inner_ty = match array_ty {
+        Type::Pointer(inner_ty) => *inner_ty,
+        other => return Err(format!("indexing expects a pointer, got {:?}", other)),
+    };
+
+    let inner_llvm_type: BasicTypeEnum = inner_ty
+        .to_llvm_type(code_gen)
+        .try_into()
+        .expect("Compiler Error: indexed pointer cannot point to void.");
+
+    let element_ptr = unsafe {
+        code_gen
+            .builder
+            .build_gep(
+                inner_llvm_type,
+                array_value.into_pointer_value(),
+                &[index],
+                "index_ptr",
+            )
+            .unwrap()
+    };
+
+    Ok((element_ptr, inner_ty))
+}
+
 impl AssignmentStmt {
     fn buildAssignment<'ctx>(&self, code_gen: &Codegen<'ctx>) -> InstructionValue<'ctx> {
         let context = &code_gen.context;
         let module = &code_gen.module;
         let builder = &code_gen.builder;
+
+        if let Some(index) = &self.index {
+            let array_expr = Expr::Operand(Token::Identifier(self.name.clone()));
+            let (target_ptr, inner_ty) = buildIndexPointer(&array_expr, index, code_gen)
+                .expect("Compiler Error: Failed to build indexed assignment pointer.");
+            let (evaluated_val, value_ty) = self
+                .value
+                .clone()
+                .expect("Compiler Error: indexed assignment must have a value.")
+                .llvm_expr(code_gen)
+                .expect("Compiler Error: Failed to compile indexed assignment value.");
+
+            if value_ty != inner_ty {
+                panic!(
+                    "Compiler Error: cannot store value of type {:?} into indexed pointer of type {:?}.",
+                    value_ty, inner_ty
+                );
+            }
+
+            return builder.build_store(target_ptr, evaluated_val).unwrap();
+        }
+
+        if self.dereference {
+            let (ptr, pointer_ty) = {
+                let table_ref = code_gen.symbol_table.borrow();
+                table_ref
+                    .iter()
+                    .rev()
+                    .find_map(|scope| scope.get(&self.name))
+                    .cloned()
+                    .expect(&format!("{:?} has not been defined.", &self.name))
+            };
+
+            let inner_ty = match pointer_ty.clone() {
+                Type::Pointer(inner_ty) => *inner_ty,
+                _ => panic!(
+                    "Compiler Error: cannot dereference non-pointer variable {:?}.",
+                    self.name
+                ),
+            };
+
+            let pointer_llvm_type: BasicTypeEnum = pointer_ty
+                .to_llvm_type(&code_gen)
+                .try_into()
+                .expect("Compiler Error: pointer variable should have an LLVM basic type.");
+
+            let target_ptr = builder
+                .build_load(pointer_llvm_type, ptr, &self.name)
+                .unwrap()
+                .into_pointer_value();
+
+            let (evaluated_val, value_ty) = self
+                .value
+                .clone()
+                .expect("Compiler Error: pointer stores must have a value.")
+                .llvm_expr(code_gen)
+                .expect("Compiler Error: Failed to compile pointer store value.");
+
+            if value_ty != inner_ty {
+                panic!(
+                    "Compiler Error: cannot store value of type {:?} into pointer to {:?}.",
+                    value_ty, inner_ty
+                );
+            }
+
+            return builder.build_store(target_ptr, evaluated_val).unwrap();
+        }
 
         let llvm_any_type = match self.ty.clone() {
             Some(x) => x.to_llvm_type(&code_gen),
@@ -329,18 +608,15 @@ impl AssignmentStmt {
             .expect("Compiler Error: Local variables cannot be initialized with Void types.");
 
         let local_var = builder.build_alloca(llvm_basic_type, &self.name).unwrap();
-        println!(
-            "{:?} safdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-            self.value.clone()
-        );
 
-        let (evaluated_val, ty) = self
+        let (evaluated_val, value_ty) = self
             .value
             .clone()
-            .expect("Compiler Error: Local variables must be initialized with a default value.")
+            .expect("Compiler Error: Local variables must be initialized with a value.")
             .llvm_expr(code_gen)
-            .expect("REASON");
+            .expect("Compiler Error: Failed to compile local variable initializer.");
 
+        let stored_ty = self.ty.clone().unwrap_or(value_ty);
         let store_instruction = builder.build_store(local_var, evaluated_val).unwrap();
 
         let mut table_ref = code_gen.symbol_table.borrow_mut();
@@ -349,21 +625,337 @@ impl AssignmentStmt {
             .expect("Compiler Error: No active compilation scope found.");
 
         if !current_scope.contains_key(&self.name) {
-            current_scope.insert(self.name.clone(), (local_var, ty));
+            current_scope.insert(self.name.clone(), (local_var, stored_ty));
         }
         store_instruction
     }
 }
 impl Expr {
-    fn buildExprs<'ctx>(&self, code_gen: &Codegen<'ctx>) -> InstructionValue<'ctx> {
-        let (evaluated_val, _ty) = self
-            .llvm_expr(code_gen)
-            .expect("Compiler Error: Failed to codegen standalone expression line.");
+    fn buildExprs<'ctx>(&self, code_gen: &Codegen<'ctx>) {
+        if let Expr::Operand(Token::Call(name, args)) = self {
+            if name == "print" {
+                buildPrint(args, code_gen);
+                return;
+            }
+            if name == "free" {
+                buildFree(args, code_gen);
+                return;
+            }
+            if name == "array_set" {
+                buildArraySet(args, code_gen);
+                return;
+            }
+            if name == "push" {
+                buildPush(args, code_gen);
+                return;
+            }
+        }
 
-        evaluated_val
-            .as_instruction_value()
-            .expect("Compiler Error: Standalone expression did not produce an instruction.")
+        self.llvm_expr(code_gen)
+            .expect("Compiler Error: Failed to codegen standalone expression line.");
     }
+}
+
+fn declareBuiltinFunctions<'ctx>(code_gen: &Codegen<'ctx>) {
+    getPrintf(code_gen);
+    getMalloc(code_gen);
+    getFree(code_gen);
+}
+
+fn getPrintf<'ctx>(code_gen: &Codegen<'ctx>) -> FunctionValue<'ctx> {
+    if let Some(function) = code_gen.module.get_function("printf") {
+        return function;
+    }
+
+    let i32_type = code_gen.context.i32_type();
+    let ptr_type = code_gen.context.ptr_type(inkwell::AddressSpace::default());
+    let printf_type = i32_type.fn_type(&[ptr_type.into()], true);
+
+    code_gen.module.add_function("printf", printf_type, None)
+}
+
+fn getMalloc<'ctx>(code_gen: &Codegen<'ctx>) -> FunctionValue<'ctx> {
+    if let Some(function) = code_gen.module.get_function("malloc") {
+        return function;
+    }
+
+    let i64_type = code_gen.context.i64_type();
+    let ptr_type = code_gen.context.ptr_type(inkwell::AddressSpace::default());
+    let malloc_type = ptr_type.fn_type(&[i64_type.into()], false);
+
+    code_gen.module.add_function("malloc", malloc_type, None)
+}
+
+fn getFree<'ctx>(code_gen: &Codegen<'ctx>) -> FunctionValue<'ctx> {
+    if let Some(function) = code_gen.module.get_function("free") {
+        return function;
+    }
+
+    let ptr_type = code_gen.context.ptr_type(inkwell::AddressSpace::default());
+    let free_type = code_gen
+        .context
+        .void_type()
+        .fn_type(&[ptr_type.into()], false);
+
+    code_gen.module.add_function("free", free_type, None)
+}
+
+fn buildPrint<'ctx>(args: &Vec<Expr>, code_gen: &Codegen<'ctx>) {
+    if args.len() != 1 {
+        panic!("Compiler Error: print expects exactly one argument.");
+    }
+
+    let (mut value, ty) = args[0]
+        .llvm_expr(code_gen)
+        .expect("Compiler Error: Failed to compile print argument.");
+
+    let format_string = match ty {
+        Type::I8
+        | Type::I16
+        | Type::I32
+        | Type::U8
+        | Type::U16
+        | Type::U32
+        | Type::Bool
+        | Type::Char => "%d\n",
+        Type::I64 | Type::U64 => "%lu\n",
+        Type::F32 => {
+            let f64_type = code_gen.context.f64_type();
+            let extended = code_gen
+                .builder
+                .build_float_ext(value.into_float_value(), f64_type, "print_f64_tmp")
+                .unwrap();
+            value = extended.into();
+            "%f\n"
+        }
+        Type::F64 => "%f\n",
+        Type::Pointer(_) => "%p\n",
+        Type::Array(_, _) => panic!("Compiler Error: print cannot print arrays directly yet."),
+        Type::Void => panic!("Compiler Error: print cannot print void."),
+    };
+
+    let printf = getPrintf(code_gen);
+    let format_ptr = code_gen
+        .builder
+        .build_global_string_ptr(format_string, "print_format")
+        .unwrap()
+        .as_pointer_value();
+
+    code_gen
+        .builder
+        .build_call(printf, &[format_ptr.into(), value.into()], "print_call")
+        .unwrap();
+}
+
+fn buildFree<'ctx>(args: &Vec<Expr>, code_gen: &Codegen<'ctx>) {
+    if args.len() != 1 {
+        panic!("Compiler Error: free expects exactly one argument.");
+    }
+
+    let (ptr_value, ptr_ty) = args[0]
+        .llvm_expr(code_gen)
+        .expect("Compiler Error: Failed to compile free argument.");
+
+    match ptr_ty {
+        Type::Pointer(_) => {}
+        _ => panic!("Compiler Error: free expects a pointer, got {:?}.", ptr_ty),
+    }
+
+    let free = getFree(code_gen);
+    code_gen
+        .builder
+        .build_call(free, &[ptr_value.into()], "free_call")
+        .unwrap();
+}
+
+fn buildArraySet<'ctx>(args: &Vec<Expr>, code_gen: &Codegen<'ctx>) {
+    if args.len() != 3 {
+        panic!("Compiler Error: array_set expects array, index, and value.");
+    }
+
+    let (target_ptr, inner_ty) = buildIndexPointer(&args[0], &args[1], code_gen)
+        .expect("Compiler Error: Failed to build array_set pointer.");
+    let (value, value_ty) = args[2]
+        .llvm_expr(code_gen)
+        .expect("Compiler Error: Failed to compile array_set value.");
+
+    if value_ty != inner_ty {
+        panic!(
+            "Compiler Error: cannot array_set value of type {:?} into array of {:?}.",
+            value_ty, inner_ty
+        );
+    }
+
+    code_gen.builder.build_store(target_ptr, value).unwrap();
+}
+
+fn buildArrayGet<'ctx>(
+    args: &Vec<Expr>,
+    code_gen: &Codegen<'ctx>,
+) -> Result<(BasicValueEnum<'ctx>, Type), String> {
+    if args.len() != 2 {
+        return Err("Compiler Error: array_get expects array and index.".to_string());
+    }
+
+    let (element_ptr, inner_ty) = buildIndexPointer(&args[0], &args[1], code_gen)?;
+    let inner_llvm_type: BasicTypeEnum = inner_ty
+        .to_llvm_type(code_gen)
+        .try_into()
+        .expect("Compiler Error: array_get pointer cannot point to void.");
+    let loaded_val = code_gen
+        .builder
+        .build_load(inner_llvm_type, element_ptr, "array_get_load")
+        .unwrap();
+
+    Ok((loaded_val, inner_ty))
+}
+
+fn buildPop<'ctx>(
+    args: &Vec<Expr>,
+    code_gen: &Codegen<'ctx>,
+) -> Result<(BasicValueEnum<'ctx>, Type), String> {
+    if args.len() != 2 {
+        return Err("Compiler Error: pop expects array and length pointer.".to_string());
+    }
+
+    let (len_ptr_value, len_ptr_ty) = args[1].llvm_expr(code_gen)?;
+    let len_inner_ty = match len_ptr_ty {
+        Type::Pointer(inner_ty) => *inner_ty,
+        other => {
+            return Err(format!(
+                "Compiler Error: pop length argument must be a pointer, got {:?}.",
+                other
+            ));
+        }
+    };
+    let len_llvm_type: BasicTypeEnum = len_inner_ty
+        .to_llvm_type(code_gen)
+        .try_into()
+        .expect("Compiler Error: pop length pointer cannot point to void.");
+    let len_ptr = len_ptr_value.into_pointer_value();
+    let len_value = code_gen
+        .builder
+        .build_load(len_llvm_type, len_ptr, "pop_len")
+        .unwrap()
+        .into_int_value();
+    let one = len_value.get_type().const_int(1, false);
+    let new_len = code_gen
+        .builder
+        .build_int_sub(len_value, one, "pop_new_len")
+        .unwrap();
+    code_gen.builder.build_store(len_ptr, new_len).unwrap();
+
+    let (array_value, array_ty) = args[0].llvm_expr(code_gen)?;
+    let inner_ty = match array_ty {
+        Type::Pointer(inner_ty) => *inner_ty,
+        other => {
+            return Err(format!(
+                "Compiler Error: pop array argument must be a pointer, got {:?}.",
+                other
+            ));
+        }
+    };
+    let inner_llvm_type: BasicTypeEnum = inner_ty
+        .to_llvm_type(code_gen)
+        .try_into()
+        .expect("Compiler Error: pop array cannot point to void.");
+    let index = index_to_i64(new_len.into(), code_gen);
+    let element_ptr = unsafe {
+        code_gen
+            .builder
+            .build_gep(
+                inner_llvm_type,
+                array_value.into_pointer_value(),
+                &[index],
+                "pop_ptr",
+            )
+            .unwrap()
+    };
+    let loaded_val = code_gen
+        .builder
+        .build_load(inner_llvm_type, element_ptr, "pop_value")
+        .unwrap();
+
+    Ok((loaded_val, inner_ty))
+}
+
+fn buildPush<'ctx>(args: &Vec<Expr>, code_gen: &Codegen<'ctx>) {
+    if args.len() != 3 {
+        panic!("Compiler Error: push expects array, length pointer, and value.");
+    }
+
+    let (len_ptr_value, len_ptr_ty) = args[1]
+        .llvm_expr(code_gen)
+        .expect("Compiler Error: Failed to compile push length pointer.");
+    let len_inner_ty = match len_ptr_ty {
+        Type::Pointer(inner_ty) => *inner_ty,
+        other => panic!(
+            "Compiler Error: push length argument must be a pointer, got {:?}.",
+            other
+        ),
+    };
+    let len_llvm_type: BasicTypeEnum = len_inner_ty
+        .to_llvm_type(code_gen)
+        .try_into()
+        .expect("Compiler Error: push length pointer cannot point to void.");
+    let len_ptr = len_ptr_value.into_pointer_value();
+    let len_value = code_gen
+        .builder
+        .build_load(len_llvm_type, len_ptr, "push_len")
+        .unwrap()
+        .into_int_value();
+
+    let (target_ptr, inner_ty) =
+        buildIndexPointer(&args[0], &Expr::Operand(Token::Int(0)), code_gen)
+            .expect("Compiler Error: Failed to validate push array pointer.");
+    let _ = target_ptr;
+    let (array_value, array_ty) = args[0]
+        .llvm_expr(code_gen)
+        .expect("Compiler Error: Failed to compile push array.");
+    let array_inner_ty = match array_ty {
+        Type::Pointer(inner_ty) => *inner_ty,
+        other => panic!(
+            "Compiler Error: push array argument must be a pointer, got {:?}.",
+            other
+        ),
+    };
+    if array_inner_ty != inner_ty {
+        panic!("Compiler Error: push internal type mismatch.");
+    }
+    let inner_llvm_type: BasicTypeEnum = array_inner_ty
+        .to_llvm_type(code_gen)
+        .try_into()
+        .expect("Compiler Error: push array cannot point to void.");
+    let index = index_to_i64(len_value.into(), code_gen);
+    let element_ptr = unsafe {
+        code_gen
+            .builder
+            .build_gep(
+                inner_llvm_type,
+                array_value.into_pointer_value(),
+                &[index],
+                "push_ptr",
+            )
+            .unwrap()
+    };
+
+    let (value, value_ty) = args[2]
+        .llvm_expr(code_gen)
+        .expect("Compiler Error: Failed to compile push value.");
+    if value_ty != array_inner_ty {
+        panic!(
+            "Compiler Error: cannot push value of type {:?} into array of {:?}.",
+            value_ty, array_inner_ty
+        );
+    }
+    code_gen.builder.build_store(element_ptr, value).unwrap();
+
+    let one = len_value.get_type().const_int(1, false);
+    let new_len = code_gen
+        .builder
+        .build_int_add(len_value, one, "push_new_len")
+        .unwrap();
+    code_gen.builder.build_store(len_ptr, new_len).unwrap();
 }
 
 fn buildReturn<'ctx>(expr: &Option<Expr>, code_gen: &Codegen<'ctx>) -> InstructionValue<'ctx> {
@@ -382,6 +974,22 @@ fn buildReturn<'ctx>(expr: &Option<Expr>, code_gen: &Codegen<'ctx>) -> Instructi
     }
 }
 
+fn buildBreak<'ctx>(code_gen: &Codegen<'ctx>) -> InstructionValue<'ctx> {
+    let loop_context = code_gen.current_loop();
+    code_gen
+        .builder
+        .build_unconditional_branch(loop_context.break_block)
+        .unwrap()
+}
+
+fn buildContinue<'ctx>(code_gen: &Codegen<'ctx>) -> InstructionValue<'ctx> {
+    let loop_context = code_gen.current_loop();
+    code_gen
+        .builder
+        .build_unconditional_branch(loop_context.continue_block)
+        .unwrap()
+}
+
 impl GlobalDecl {
     fn buildGlobal<'ctx>(&self, code_gen: &Codegen<'ctx>) -> GlobalValue<'ctx> {
         let context = &code_gen.context;
@@ -397,10 +1005,12 @@ impl GlobalDecl {
         let global_var = module.add_global(llvm_basic_type, None, &self.name);
         global_var.set_linkage(inkwell::module::Linkage::External);
 
-        let (evaluated_val,ty) = self.value.clone()
-		    .expect("global varbles cannot be initialized without declareing a defalt value for it as they are constant")
-		    .llvm_expr(code_gen)
-		    .expect("REASON");
+        let (evaluated_val, ty) = self
+            .value
+            .clone()
+            .expect("Compiler Error: Global variables must be initialized with a value.")
+            .llvm_expr(code_gen)
+            .expect("Compiler Error: Failed to compile global variable initializer.");
 
         if self.pointer && !evaluated_val.is_pointer_value() && !evaluated_val.is_int_value() {
             std::panic::panic_any(
@@ -523,13 +1133,28 @@ impl Type {
     }
 }
 
+fn size_of_type(ty: &Type) -> u64 {
+    match ty {
+        Type::I8 | Type::U8 | Type::Bool | Type::Char => 1,
+        Type::I16 | Type::U16 => 2,
+        Type::I32 | Type::U32 | Type::F32 => 4,
+        Type::I64 | Type::U64 | Type::F64 | Type::Pointer(_) => 8,
+        Type::Array(inner_type, len) => size_of_type(inner_type) * (*len as u64),
+        Type::Void => panic!("Compiler Error: cannot get size of void"),
+    }
+}
+
 impl Expr {
     fn llvm_expr<'ctx>(
         &self,
         code_gen: &Codegen<'ctx>,
     ) -> Result<(BasicValueEnum<'ctx>, Type), String> {
-        println!("{:?}fff", self);
         match self {
+            Expr::SizeOf(ty) => {
+                let u64_type = code_gen.context.i64_type();
+                let const_val = u64_type.const_int(size_of_type(ty), false);
+                Ok((const_val.into(), Type::U64))
+            }
             Expr::Operand(x) => match x {
                 Token::Int(t) => {
                     let i32_type = code_gen.context.i32_type();
@@ -625,6 +1250,13 @@ impl Expr {
                     Ok((value, ty))
                 }
                 Token::Call(func_name, args_exprs) => {
+                    if func_name == "array_get" {
+                        return buildArrayGet(args_exprs, code_gen);
+                    }
+                    if func_name == "pop" {
+                        return buildPop(args_exprs, code_gen);
+                    }
+
                     let function = code_gen.module.get_function(func_name).expect(&format!(
                         "Compiler Error: Function {} is not defined.",
                         func_name
@@ -658,6 +1290,19 @@ impl Expr {
             },
             Expr::Operation(x, y) => {
                 if y.len() == 2 {
+                    if *x == Token::LBracket {
+                        let (element_ptr, inner_ty) = buildIndexPointer(&y[0], &y[1], code_gen)?;
+                        let inner_llvm_type: BasicTypeEnum = inner_ty
+                            .to_llvm_type(code_gen)
+                            .try_into()
+                            .expect("Compiler Error: indexed pointer cannot point to void.");
+                        let loaded_val = code_gen
+                            .builder
+                            .build_load(inner_llvm_type, element_ptr, "index_load")
+                            .unwrap();
+                        return Ok((loaded_val, inner_ty));
+                    }
+
                     let (left_val, ty) = y[0].llvm_expr(code_gen)?;
                     let (right_val, tyR) = y[1].llvm_expr(code_gen)?;
                     match (left_val, right_val) {
@@ -734,6 +1379,18 @@ impl Expr {
                                         left_int,
                                         right_int,
                                         "cmp_eq_tmp",
+                                    )
+                                    .unwrap();
+                                return Ok((result.into(), Type::Bool));
+                            }
+                            Token::NotEqual => {
+                                let result = code_gen
+                                    .builder
+                                    .build_int_compare(
+                                        inkwell::IntPredicate::NE,
+                                        left_int,
+                                        right_int,
+                                        "cmp_ne_tmp",
                                     )
                                     .unwrap();
                                 return Ok((result.into(), Type::Bool));
@@ -833,6 +1490,18 @@ impl Expr {
                                     .unwrap();
                                 return Ok((result.into(), Type::Bool));
                             }
+                            Token::NotEqual => {
+                                let result = code_gen
+                                    .builder
+                                    .build_float_compare(
+                                        inkwell::FloatPredicate::ONE,
+                                        left_float,
+                                        right_float,
+                                        "fcmp_ne_tmp",
+                                    )
+                                    .unwrap();
+                                return Ok((result.into(), Type::Bool));
+                            }
                             Token::GreaterEqual => {
                                 let result = code_gen
                                     .builder
@@ -870,7 +1539,7 @@ impl Expr {
                         Token::LParen => {
                             return y
                                 .get(0)
-                                .expect("this should have one argument")
+                                .expect("Compiler Error: Parenthesized expression is missing its inner expression.")
                                 .llvm_expr(code_gen);
                         }
                         Token::Ampersand => {
@@ -894,7 +1563,9 @@ impl Expr {
 
                                     Ok((ptr.into(), Type::Pointer(Box::new(ty))))
                                 }
-                                _ => panic!("operations cannot be addressed"),
+                                _ => panic!(
+                                    "Compiler Error: only named variables can be used with the address-of operator '&'."
+                                ),
                             }
                         }
                         Token::Star => {

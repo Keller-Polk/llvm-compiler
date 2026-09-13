@@ -57,6 +57,7 @@ pub enum Token {
     Return,
     Continue,
     Break,
+    SizeOf,
 
     // types
     Type(Type),
@@ -168,6 +169,7 @@ impl Token {
                     "false" => Token::Bool(false),
                     "continue" => Token::Continue,
                     "break" => Token::Break,
+                    "sizeof" => Token::SizeOf,
                     "i8" => Token::Type(Type::I8),
                     "i16" => Token::Type(Type::I16),
                     "i32" => Token::Type(Type::I32),

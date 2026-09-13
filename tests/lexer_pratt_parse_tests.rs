@@ -81,6 +81,20 @@ mod lexer_tests {
     }
 
     #[test]
+    fn test_sizeof_keyword() {
+        let tokens = Token::lexer("sizeof(i32)").tokens;
+        assert_eq!(
+            tokens,
+            vec![
+                Token::SizeOf,
+                Token::LParen,
+                Token::Type(Type::I32),
+                Token::RParen,
+            ]
+        );
+    }
+
+    #[test]
     fn test_multi_char_operators() {
         let tokens = Token::lexer("== != <= >=").tokens;
         assert_eq!(
@@ -179,6 +193,39 @@ mod parser_tests {
     }
 
     #[test]
+    fn test_parse_sizeof_expression() {
+        let program = parse_program("u64: x = sizeof(i32);");
+
+        assert_eq!(
+            program.items,
+            vec![Item::Global(GlobalDecl {
+                name: "x".to_string(),
+                ty: Type::U64,
+                value: Some(Expr::SizeOf(Type::I32)),
+                pointer: false,
+            })]
+        );
+    }
+
+    #[test]
+    fn test_parse_sizeof_in_math_expression() {
+        let program = parse_program("u64: x = sizeof(i32) * 10;");
+
+        assert_eq!(
+            program.items,
+            vec![Item::Global(GlobalDecl {
+                name: "x".to_string(),
+                ty: Type::U64,
+                value: Some(Expr::Operation(
+                    Token::Star,
+                    vec![Expr::SizeOf(Type::I32), Expr::Operand(Token::Int(10)),]
+                )),
+                pointer: false,
+            })]
+        );
+    }
+
+    #[test]
     fn test_parse_empty_function() {
         let program = parse_program(
             "
@@ -269,6 +316,8 @@ mod parser_tests {
                     ty: Some(Type::I32),
                     value: Some(Expr::Operand(Token::Int(10))),
                     pointer: false,
+                    dereference: false,
+                    index: None,
                 })],
             })]
         );
