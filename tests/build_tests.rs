@@ -21,7 +21,7 @@ fn assert_build_ok(input: &str) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let program = parse_program(input);
-    program.build();
+    program.build("output");
 }
 
 fn assert_build_runs_with_output(input: &str, expected_stdout: &str) {
@@ -29,7 +29,7 @@ fn assert_build_runs_with_output(input: &str, expected_stdout: &str) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let program = parse_program(input);
-    program.build();
+    program.build("output");
 
     let output = Command::new("./output")
         .output()
