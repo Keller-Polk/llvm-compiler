@@ -1,8 +1,10 @@
 # Compiler
 
-A small C-like programming language compiler written in Rust. It lexes, parses, builds an AST, generates LLVM IR with [`inkwell`](https://github.com/TheDan64/inkwell), emits an object file, and links it into a native executable.
+A small C-like programming language compiler written in Rust. It lexes, parses, builds an AST, generates LLVM IR ,and emits an object file, and links it into a native executable.
 
-The project is currently experimental, but it already supports functions, variables, pointers, memory allocation, printing, loops, conditionals, and simple pointer-backed arrays.
+The project is currently experimental, but it already supports all the basic components of a simple language like functions, variables, pointers, memory allocation, printing, loops, conditionals, and simple pointer-backed arrays.
+
+it generates LLVM IR with [`inkwell`](https://github.com/TheDan64/inkwell).
 
 ## Features
 
