@@ -151,7 +151,7 @@ Requirements:
 Clone the repository:
 
 ```sh
-git clone <your-repo-url>
+git clone <https://github.com/Keller-Polk/llvm-compiler>
 cd compiler
 ```
 
