@@ -85,11 +85,6 @@ Download the Linux binary named:
 compiler
 ```
 
-Make it executable if needed:
-
-```sh
-chmod +x compiler
-```
 
 Run it on a source file:
 
@@ -125,11 +120,6 @@ or:
 ./compiler --filepath path/to/file.lang
 ```
 
-If no filepath is provided, it defaults to:
-
-```text
-src/test.lang
-```
 
 The output executable uses the same base name as the input file:
 
